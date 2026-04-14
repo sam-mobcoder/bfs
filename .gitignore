@@ -1,0 +1,14 @@
+.venv/
+.venv/*
+__pycache__/
+__pycache__/*
+__pycache__
+__pycache__/*
+models/
+*.safetensors
+*.bin
+*.ckpt
+*.pt
+*.pth
+*.png
+*_bfs_swap.*
