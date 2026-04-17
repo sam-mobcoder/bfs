@@ -74,3 +74,6 @@ typer==0.24.1
 typing_extensions==4.15.0
 urllib3==2.6.3
 zipp==3.23.1
+fastapi
+uvicorn
+python-multipart
