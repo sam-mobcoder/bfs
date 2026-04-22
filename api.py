@@ -26,7 +26,10 @@ from swap_face import (
     _fit_on_canvas,
     _load_pipe,
     _resolve_device,
+    _resolve_generation_size,
 )
+
+_MEMORY_MODES = frozenset({"auto", "full", "offload", "sequential"})
 
 app = FastAPI(title="BFS Face Swap API", version="1.0.0")
 app.add_middleware(
@@ -37,7 +40,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PIPELINE_CACHE: dict[tuple[str, str, str], object] = {}
+PIPELINE_CACHE: dict[tuple[str, str, str, str], object] = {}
 PIPELINE_CACHE_LOCK = threading.Lock()
 
 
@@ -65,8 +68,10 @@ def _to_data_url_png(image_base64: str) -> str:
     return f"data:image/png;base64,{image_base64}"
 
 
-def _get_or_load_pipe(cache_path: Path, variant_filename: str, resolved_device: str):
-    cache_key = (str(cache_path), variant_filename, resolved_device)
+def _get_or_load_pipe(
+    cache_path: Path, variant_filename: str, resolved_device: str, memory_mode: str
+):
+    cache_key = (str(cache_path), variant_filename, resolved_device, memory_mode)
     with PIPELINE_CACHE_LOCK:
         if cache_key in PIPELINE_CACHE:
             return PIPELINE_CACHE[cache_key]
@@ -75,6 +80,7 @@ def _get_or_load_pipe(cache_path: Path, variant_filename: str, resolved_device: 
         cache_dir=cache_path,
         variant_filename=variant_filename,
         device=resolved_device,
+        memory_mode=memory_mode,
     )
     with PIPELINE_CACHE_LOCK:
         PIPELINE_CACHE[cache_key] = pipe
@@ -92,11 +98,17 @@ def swap_stream(
     person: UploadFile = File(...),
     variant: str = Form("head_v5_merged_rank16"),
     prompt: str | None = Form(None),
-    steps: int = Form(30),
+    steps: int = Form(50),
     guidance: float = Form(4.0),
+    negative_prompt: str = Form(
+        "blurry, lowres, bad anatomy, deformed face, extra eyes, waxy skin, over-smoothed face, artifacts"
+    ),
     seed: int = Form(42),
     device: str = Form("auto"),
+    max_megapixels: float = Form(2.0),
+    match_person_size: bool = Form(False),
     cache_dir: str = Form("./models"),
+    memory_mode: str = Form(os.environ.get("BFS_MEMORY_MODE", "auto")),
 ) -> StreamingResponse:
     if variant not in LORA_VARIANTS:
         raise HTTPException(status_code=400, detail=f"Invalid variant '{variant}'.")
@@ -104,6 +116,13 @@ def swap_stream(
         raise HTTPException(status_code=400, detail="steps must be >= 1")
     if device not in {"auto", "cuda", "cpu"}:
         raise HTTPException(status_code=400, detail="device must be one of: auto, cuda, cpu")
+    if memory_mode not in _MEMORY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"memory_mode must be one of: {', '.join(sorted(_MEMORY_MODES))}",
+        )
+    if max_megapixels <= 0:
+        raise HTTPException(status_code=400, detail="max_megapixels must be > 0")
 
     _ensure_lora_backend()
     face_image = _read_upload_image(face)
@@ -111,6 +130,7 @@ def swap_stream(
     person_canvas_size = person_image.size
     prepared_face_image = _fit_on_canvas(face_image, person_canvas_size)
     prepared_person_image = person_image.copy()
+    gen_width, gen_height = _resolve_generation_size(person_canvas_size, max_megapixels)
 
     selected_variant = LORA_VARIANTS[variant]
     effective_prompt = prompt or selected_variant["prompt"]
@@ -142,6 +162,7 @@ def swap_stream(
                     cache_path=cache_path,
                     variant_filename=selected_variant["filename"],
                     resolved_device=resolved_device,
+                    memory_mode=memory_mode,
                 )
                 enqueue({"type": "status", "stage": "inference", "message": "Running inference..."})
 
@@ -168,12 +189,15 @@ def swap_stream(
                     prompt=effective_prompt,
                     steps=steps,
                     guidance=guidance,
+                    negative_prompt=negative_prompt,
                     seed=seed,
                     device=resolved_device,
+                    width=gen_width,
+                    height=gen_height,
                     progress_callback=on_progress,
                 )
 
-                if output_image.size != person_canvas_size:
+                if match_person_size and output_image.size != person_canvas_size:
                     output_image = _fit_on_canvas(output_image, person_canvas_size)
 
                 encoded = _image_to_base64_png(output_image)
@@ -224,11 +248,17 @@ def swap_json(
     person: UploadFile = File(...),
     variant: str = Form("head_v5_merged_rank16"),
     prompt: str | None = Form(None),
-    steps: int = Form(30),
+    steps: int = Form(50),
     guidance: float = Form(4.0),
+    negative_prompt: str = Form(
+        "blurry, lowres, bad anatomy, deformed face, extra eyes, waxy skin, over-smoothed face, artifacts"
+    ),
     seed: int = Form(42),
     device: str = Form("auto"),
+    max_megapixels: float = Form(2.0),
+    match_person_size: bool = Form(False),
     cache_dir: str = Form("./models"),
+    memory_mode: str = Form(os.environ.get("BFS_MEMORY_MODE", "auto")),
 ) -> dict[str, object]:
     if variant not in LORA_VARIANTS:
         raise HTTPException(status_code=400, detail=f"Invalid variant '{variant}'.")
@@ -236,6 +266,13 @@ def swap_json(
         raise HTTPException(status_code=400, detail="steps must be >= 1")
     if device not in {"auto", "cuda", "cpu"}:
         raise HTTPException(status_code=400, detail="device must be one of: auto, cuda, cpu")
+    if memory_mode not in _MEMORY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"memory_mode must be one of: {', '.join(sorted(_MEMORY_MODES))}",
+        )
+    if max_megapixels <= 0:
+        raise HTTPException(status_code=400, detail="max_megapixels must be > 0")
 
     _ensure_lora_backend()
     face_image = _read_upload_image(face)
@@ -243,6 +280,7 @@ def swap_json(
     person_canvas_size = person_image.size
     prepared_face_image = _fit_on_canvas(face_image, person_canvas_size)
     prepared_person_image = person_image.copy()
+    gen_width, gen_height = _resolve_generation_size(person_canvas_size, max_megapixels)
 
     selected_variant = LORA_VARIANTS[variant]
     effective_prompt = prompt or selected_variant["prompt"]
@@ -258,6 +296,7 @@ def swap_json(
         cache_path=cache_path,
         variant_filename=selected_variant["filename"],
         resolved_device=resolved_device,
+        memory_mode=memory_mode,
     )
     output_image = _call_pipe(
         pipe=pipe,
@@ -266,11 +305,14 @@ def swap_json(
         prompt=effective_prompt,
         steps=steps,
         guidance=guidance,
+        negative_prompt=negative_prompt,
         seed=seed,
         device=resolved_device,
+        width=gen_width,
+        height=gen_height,
     )
 
-    if output_image.size != person_canvas_size:
+    if match_person_size and output_image.size != person_canvas_size:
         output_image = _fit_on_canvas(output_image, person_canvas_size)
 
     encoded = _image_to_base64_png(output_image)

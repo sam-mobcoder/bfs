@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
 from diffusers import AutoPipelineForImage2Image
+from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_qwen_lora_to_diffusers
 from PIL import Image
 from safetensors.torch import load_file
 
@@ -58,8 +60,29 @@ def parse_args() -> argparse.Namespace:
         help="BFS LoRA variant",
     )
     parser.add_argument("--prompt", default=None, help="Optional custom prompt")
-    parser.add_argument("--steps", type=int, default=30, help="Inference steps")
-    parser.add_argument("--guidance", type=float, default=4.0, help="Guidance scale")
+    parser.add_argument("--steps", type=int, default=50, help="Inference steps")
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=4.0,
+        help="True CFG scale (higher follows prompt more, but too high can hurt realism)",
+    )
+    parser.add_argument(
+        "--negative-prompt",
+        default="blurry, lowres, bad anatomy, deformed face, extra eyes, waxy skin, over-smoothed face, artifacts",
+        help="Negative prompt to enable true CFG and suppress common face artifacts",
+    )
+    parser.add_argument(
+        "--max-megapixels",
+        type=float,
+        default=2.0,
+        help="Generation resolution cap in megapixels (higher can improve face detail, uses more VRAM/time)",
+    )
+    parser.add_argument(
+        "--match-person-size",
+        action="store_true",
+        help="Resize output back to person image dimensions (disabled by default to avoid quality loss).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--device",
@@ -71,6 +94,15 @@ def parse_args() -> argparse.Namespace:
         "--cache-dir",
         default="./models",
         help="Model cache directory where base model and LoRA are downloaded",
+    )
+    parser.add_argument(
+        "--memory",
+        choices=["auto", "full", "offload", "sequential"],
+        default=os.environ.get("BFS_MEMORY_MODE", "auto"),
+        help="GPU memory strategy. 'full' keeps the pipeline on VRAM (best speed/quality on large GPUs). "
+        "'offload' moves weights CPU<->GPU each step (low peak VRAM, often ~40–45GB). "
+        "'auto' uses full VRAM when the GPU reports >=72GiB total memory, else offload. "
+        "Override default with env BFS_MEMORY_MODE.",
     )
     parser.add_argument("--output", default=None, help="Output path. Defaults beside person image")
     return parser.parse_args()
@@ -97,6 +129,12 @@ def _ensure_lora_backend() -> None:
 
 
 def _load_bfs_lora_state_dict(lora_path: Path) -> dict[str, torch.Tensor]:
+    """Return a state dict in diffusers Qwen LoRA format, ready for `load_lora_weights`.
+
+    BFS releases omit per-layer ``.alpha`` tensors. Diffusers' converter expects them and
+    implements Kohya-style scaling ``(alpha/rank) * B @ A @ x``. Using ``alpha = rank`` is
+    the usual default when alpha is absent (scale 1.0); weights are unchanged before fusion.
+    """
     state_dict = load_file(str(lora_path))
 
     # BFS head checkpoints include extra tensor keys (`.diff_b`, layer norm `.diff`) that
@@ -107,17 +145,11 @@ def _load_bfs_lora_state_dict(lora_path: Path) -> dict[str, torch.Tensor]:
         if not (k.endswith(".diff_b") or k.endswith(".diff"))
     }
 
-    # Some BFS checkpoints are in a non-diffusers LoRA format and miss `*.alpha`.
-    # Diffusers' Qwen conversion expects these keys to exist.
-    alpha_count = 0
     for key, down_weight in list(state_dict.items()):
         if not key.endswith(".lora_down.weight"):
             continue
 
-        rank = down_weight.shape[0]
-        alpha_tensor = torch.tensor(float(rank), dtype=down_weight.dtype)
-
-        # Expected by qwen converter after prefix stripping.
+        rank = int(down_weight.shape[0])
         base_key = key
         if base_key.startswith("diffusion_model."):
             base_key = base_key[len("diffusion_model.") :]
@@ -125,16 +157,43 @@ def _load_bfs_lora_state_dict(lora_path: Path) -> dict[str, torch.Tensor]:
         alpha_key = f"{base_key}.alpha"
 
         if alpha_key not in state_dict:
-            state_dict[alpha_key] = alpha_tensor
-            alpha_count += 1
+            state_dict[alpha_key] = torch.tensor(float(rank), dtype=down_weight.dtype)
 
-    if alpha_count > 0:
-        print(f"Added {alpha_count} missing LoRA alpha keys for BFS compatibility.")
-
-    return state_dict
+    return _convert_non_diffusers_qwen_lora_to_diffusers(state_dict)
 
 
-def _load_pipe(cache_dir: Path, variant_filename: str, device: str) -> AutoPipelineForImage2Image:
+def _resolve_memory_mode(requested: str, device: str) -> str:
+    if device != "cuda":
+        return "full"
+    if requested != "auto":
+        return requested
+    total = torch.cuda.get_device_properties(0).total_memory
+    # Qwen Image Edit + LoRA often needs well under 80GiB but can exceed ~48GiB full load.
+    return "full" if total >= 72 * (1024**3) else "offload"
+
+
+def _move_pipeline_to_device(
+    pipe: AutoPipelineForImage2Image, device: str, memory_mode: str
+) -> None:
+    if device != "cuda":
+        pipe.to(device)
+        return
+
+    mode = _resolve_memory_mode(memory_mode, device)
+    if mode == "full":
+        pipe.to("cuda")
+    elif mode == "sequential":
+        pipe.enable_sequential_cpu_offload()
+    else:
+        pipe.enable_model_cpu_offload()
+
+
+def _load_pipe(
+    cache_dir: Path,
+    variant_filename: str,
+    device: str,
+    memory_mode: str = "auto",
+) -> AutoPipelineForImage2Image:
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     base_dir = cache_dir / "Qwen-Image-Edit-2511"
@@ -151,12 +210,7 @@ def _load_pipe(cache_dir: Path, variant_filename: str, device: str) -> AutoPipel
     state_dict = _load_bfs_lora_state_dict(lora_path)
     pipe.load_lora_weights(state_dict)
 
-    if device == "cuda":
-        # Avoid `device_map="cuda"` here: it loads the full stack on GPU at once and
-        # can OOM on ~48GB cards when transformers runs its CUDA allocator warmup.
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe = pipe.to(device)
+    _move_pipeline_to_device(pipe, device, memory_mode)
 
     return pipe
 
@@ -168,8 +222,11 @@ def _call_pipe(
     prompt: str,
     steps: int,
     guidance: float,
+    negative_prompt: str | None,
     seed: int,
     device: str,
+    width: int | None = None,
+    height: int | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> Image.Image:
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -182,9 +239,13 @@ def _call_pipe(
 
     common_kwargs: dict[str, Any] = {
         "num_inference_steps": steps,
-        "guidance_scale": guidance,
+        "true_cfg_scale": guidance,
+        "negative_prompt": negative_prompt if negative_prompt is not None else " ",
         "generator": generator,
     }
+    if width is not None and height is not None:
+        common_kwargs["width"] = width
+        common_kwargs["height"] = height
 
     if progress_callback is not None:
         common_kwargs["callback_on_step_end"] = _step_callback
@@ -242,6 +303,27 @@ def _fit_on_canvas(source: Image.Image, canvas_size: tuple[int, int], fill_color
     return canvas
 
 
+def _resolve_generation_size(
+    source_size: tuple[int, int], max_megapixels: float, multiple: int = 32
+) -> tuple[int, int]:
+    src_w, src_h = source_size
+    if max_megapixels <= 0:
+        raise ValueError("--max-megapixels must be > 0")
+
+    target_area = int(max_megapixels * 1_000_000)
+    src_area = src_w * src_h
+    if src_area <= target_area:
+        width, height = src_w, src_h
+    else:
+        scale = (target_area / float(src_area)) ** 0.5
+        width = max(multiple, int((src_w * scale) // multiple) * multiple)
+        height = max(multiple, int((src_h * scale) // multiple) * multiple)
+
+    width = max(multiple, (width // multiple) * multiple)
+    height = max(multiple, (height // multiple) * multiple)
+    return width, height
+
+
 def main() -> None:
     args = parse_args()
     _ensure_lora_backend()
@@ -273,7 +355,26 @@ def main() -> None:
     else:
         print("Using CPU (CUDA unavailable or explicitly disabled)")
 
-    pipe = _load_pipe(cache_dir=cache_dir, variant_filename=variant["filename"], device=device)
+    gen_width, gen_height = _resolve_generation_size(person_canvas_size, args.max_megapixels)
+    print(
+        f"Generation size: {gen_width}x{gen_height} "
+        f"(cap={args.max_megapixels:.2f}MP, source={person_canvas_size[0]}x{person_canvas_size[1]})"
+    )
+
+    eff_mem = _resolve_memory_mode(args.memory, device)
+    if device == "cuda":
+        vram_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(
+            f"VRAM layout: {eff_mem} (requested={args.memory}, GPU total={vram_gib:.1f} GiB). "
+            "Use --memory full on large GPUs for highest throughput; --memory offload if you OOM."
+        )
+
+    pipe = _load_pipe(
+        cache_dir=cache_dir,
+        variant_filename=variant["filename"],
+        device=device,
+        memory_mode=args.memory,
+    )
     output_image = _call_pipe(
         pipe=pipe,
         image_1=image_1,
@@ -281,12 +382,15 @@ def main() -> None:
         prompt=prompt,
         steps=args.steps,
         guidance=args.guidance,
+        negative_prompt=args.negative_prompt,
         seed=args.seed,
         device=device,
+        width=gen_width,
+        height=gen_height,
     )
 
-    # Keep final export at target dimensions without stretching.
-    if output_image.size != person_canvas_size:
+    # Optional upsize back to the input size; disabled by default to preserve sharpness.
+    if args.match_person_size and output_image.size != person_canvas_size:
         output_image = _fit_on_canvas(output_image, person_canvas_size)
 
     if args.output:
